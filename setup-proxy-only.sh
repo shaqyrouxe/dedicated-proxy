@@ -14,50 +14,233 @@ echo -e "${NC}"
 
 SERVER_IP=$(hostname -I | awk '{print $1}')
 echo -e "${BOLD}Server detected IP:${NC} ${GREEN}${SERVER_IP}${NC}"
-echo ""
 
-read -rp "Proxy port [8088]: " PROXY_PORT < /dev/tty
-PROXY_PORT=${PROXY_PORT:-8088}
+# ── Detect existing installation ─────────────────────────────────────
+INSTALL_MODE="fresh"
+EXISTING_PORT=""
+EXISTING_USER=""
+EXISTING_PASS=""
+EXISTING_IPS=""
 
-read -rp "Proxy username [proxyuser]: " PROXY_USER < /dev/tty
-PROXY_USER=${PROXY_USER:-proxyuser}
+if [ -f /etc/systemd/system/rotproxy.service ] && [ -f /usr/local/proxy/bin/rotproxy.py ]; then
+    INSTALL_MODE="update"
+    EXISTING_PORT=$(grep -oP 'Environment=PROXY_PORT=\K.*' /etc/systemd/system/rotproxy.service 2>/dev/null || echo "")
+    EXISTING_USER=$(grep -oP 'Environment=PROXY_USER=\K.*' /etc/systemd/system/rotproxy.service 2>/dev/null || echo "")
+    EXISTING_PASS=$(grep -oP 'Environment=PROXY_PASS=\K.*' /etc/systemd/system/rotproxy.service 2>/dev/null || echo "")
+    if [ -f /usr/local/proxy/conf/pool.json ]; then
+        EXISTING_IPS=$(python3 -c "
+import json
+with open('/usr/local/proxy/conf/pool.json') as f:
+    data = json.load(f)
+    entries = data if isinstance(data, list) else data.get('proxies', [])
+    ips = []
+    for e in entries:
+        if e.get('type') == 'local':
+            ips.append(e.get('ip',''))
+        else:
+            ips.append(e.get('host','')+':'+str(e.get('port','')))
+    print(', '.join(ips))
+" 2>/dev/null || echo "")
+        EXISTING_POOL_COUNT=$(python3 -c "
+import json
+with open('/usr/local/proxy/conf/pool.json') as f:
+    data = json.load(f)
+    entries = data if isinstance(data, list) else data.get('proxies', [])
+    print(len(entries))
+" 2>/dev/null || echo "0")
+    fi
 
-DEFAULT_PASS=$(openssl rand -base64 16 | tr -d '/+=' | head -c 20)
-read -rp "Proxy password [${DEFAULT_PASS}]: " PROXY_PASS < /dev/tty
-PROXY_PASS=${PROXY_PASS:-$DEFAULT_PASS}
+    RUNNING_STATUS="stopped"
+    if systemctl is-active --quiet rotproxy 2>/dev/null; then
+        RUNNING_STATUS="running"
+    fi
 
-read -rp "Local IPs for rotation (comma-separated, blank = server IP only): " IP_INPUT < /dev/tty
-if [ -z "$IP_INPUT" ]; then
-    IP_POOL=("$SERVER_IP")
-else
-    IFS=',' read -ra IP_POOL <<< "$IP_INPUT"
-    for i in "${!IP_POOL[@]}"; do
-        IP_POOL[$i]=$(echo "${IP_POOL[$i]}" | tr -d ' ')
+    echo ""
+    echo -e "${YELLOW}${BOLD}  Existing installation detected!${NC}"
+    echo -e "${CYAN}──────────────────────────────────────────────────────────────${NC}"
+    echo -e "  Status   : $([ "$RUNNING_STATUS" = "running" ] && echo -e "${GREEN}Running${NC}" || echo -e "${RED}Stopped${NC}")"
+    echo -e "  Port     : ${GREEN}${EXISTING_PORT:-unknown}${NC}"
+    echo -e "  Username : ${GREEN}${EXISTING_USER:-unknown}${NC}"
+    echo -e "  Password : ${GREEN}${EXISTING_PASS:-unknown}${NC}"
+    echo -e "  Pool     : ${GREEN}${EXISTING_POOL_COUNT:-0} proxies${NC} (${EXISTING_IPS:-none})"
+    echo -e "${CYAN}──────────────────────────────────────────────────────────────${NC}"
+    echo ""
+    echo -e "  ${BOLD}1)${NC} Update proxy code & kernel tuning (keep existing config)"
+    echo -e "  ${BOLD}2)${NC} Full reconfigure (change port/auth/IPs)"
+    echo -e "  ${BOLD}3)${NC} Add IPs to existing pool"
+    echo -e "  ${BOLD}4)${NC} Cancel"
+    echo ""
+    read -rp "Choose an option [1]: " UPDATE_CHOICE < /dev/tty
+    UPDATE_CHOICE=${UPDATE_CHOICE:-1}
+
+    case "$UPDATE_CHOICE" in
+        1)
+            INSTALL_MODE="update_code"
+            PROXY_PORT="${EXISTING_PORT:-8088}"
+            PROXY_USER="${EXISTING_USER:-proxyuser}"
+            PROXY_PASS="${EXISTING_PASS:-changeme}"
+            ;;
+        2)
+            INSTALL_MODE="fresh"
+            ;;
+        3)
+            INSTALL_MODE="add_ips"
+            PROXY_PORT="${EXISTING_PORT:-8088}"
+            PROXY_USER="${EXISTING_USER:-proxyuser}"
+            PROXY_PASS="${EXISTING_PASS:-changeme}"
+            ;;
+        4)
+            echo "Cancelled."; exit 0
+            ;;
+        *)
+            echo "Invalid choice."; exit 1
+            ;;
+    esac
+fi
+
+# ── Gather configuration for fresh install or full reconfigure ───────
+if [ "$INSTALL_MODE" = "fresh" ]; then
+    echo ""
+    read -rp "Proxy port [8088]: " PROXY_PORT < /dev/tty
+    PROXY_PORT=${PROXY_PORT:-8088}
+
+    read -rp "Proxy username [proxyuser]: " PROXY_USER < /dev/tty
+    PROXY_USER=${PROXY_USER:-proxyuser}
+
+    DEFAULT_PASS=$(openssl rand -base64 16 | tr -d '/+=' | head -c 20)
+    read -rp "Proxy password [${DEFAULT_PASS}]: " PROXY_PASS < /dev/tty
+    PROXY_PASS=${PROXY_PASS:-$DEFAULT_PASS}
+
+    read -rp "Local IPs for rotation (comma-separated, blank = server IP only): " IP_INPUT < /dev/tty
+    if [ -z "$IP_INPUT" ]; then
+        IP_POOL=("$SERVER_IP")
+    else
+        IFS=',' read -ra IP_POOL <<< "$IP_INPUT"
+        for i in "${!IP_POOL[@]}"; do
+            IP_POOL[$i]=$(echo "${IP_POOL[$i]}" | tr -d ' ')
+        done
+    fi
+
+    echo ""
+    echo -e "${BOLD}Configuration Summary:${NC}"
+    echo -e "  Port     : ${GREEN}${PROXY_PORT}${NC}"
+    echo -e "  Username : ${GREEN}${PROXY_USER}${NC}"
+    echo -e "  Password : ${GREEN}${PROXY_PASS}${NC}"
+    echo -e "  IP Pool  : ${GREEN}${IP_POOL[*]}${NC}"
+    echo ""
+    read -rp "Proceed with installation? [Y/n]: " CONFIRM < /dev/tty
+    CONFIRM=${CONFIRM:-Y}
+    if [[ ! "$CONFIRM" =~ ^[Yy] ]]; then
+        echo "Aborted."; exit 1
+    fi
+fi
+
+# ── Add IPs mode: prompt for new IPs ────────────────────────────────
+if [ "$INSTALL_MODE" = "add_ips" ]; then
+    echo ""
+    echo -e "  Current pool: ${GREEN}${EXISTING_IPS}${NC}"
+    read -rp "New IPs to add (comma-separated): " NEW_IP_INPUT < /dev/tty
+    if [ -z "$NEW_IP_INPUT" ]; then
+        echo "No IPs provided. Cancelled."; exit 0
+    fi
+    IFS=',' read -ra NEW_IPS <<< "$NEW_IP_INPUT"
+    for i in "${!NEW_IPS[@]}"; do
+        NEW_IPS[$i]=$(echo "${NEW_IPS[$i]}" | tr -d ' ')
     done
+
+    echo ""
+    echo -e "${CYAN}Adding ${#NEW_IPS[@]} IP(s) to pool...${NC}"
+
+    IFACE=$(ip -4 route show default | awk '{print $5}' | head -1)
+    for IP in "${NEW_IPS[@]}"; do
+        if [ "$IP" != "$SERVER_IP" ]; then
+            if ! ip addr show dev "$IFACE" | grep -q "$IP"; then
+                ip addr add "${IP}/32" dev "$IFACE" 2>/dev/null || true
+                echo -e "  Bound ${GREEN}${IP}${NC} to ${IFACE}"
+            fi
+        fi
+    done
+
+    python3 -c "
+import json, sys, uuid
+pool_file = '/usr/local/proxy/conf/pool.json'
+try:
+    with open(pool_file) as f:
+        data = json.load(f)
+    entries = data if isinstance(data, list) else data.get('proxies', [])
+except:
+    entries = []
+existing_ips = {e.get('ip') for e in entries if e.get('type') == 'local'}
+new_ips = sys.argv[1:]
+added = 0
+for ip in new_ips:
+    if ip not in existing_ips:
+        entries.append({'id': uuid.uuid4().hex[:8], 'type': 'local', 'ip': ip, 'label': '', 'enabled': True})
+        added += 1
+        print(f'  Added: {ip}')
+    else:
+        print(f'  Skipped (already exists): {ip}')
+with open(pool_file, 'w') as f:
+    json.dump(entries, f, indent=2)
+print(f'  Pool now has {len(entries)} entries ({added} new)')
+" "${NEW_IPS[@]}"
+
+    systemctl restart rotproxy
+    sleep 2
+    echo -e "  ${GREEN}Proxy restarted with updated pool${NC}"
+
+    echo ""
+    echo -e "${CYAN}Running rotation test (5 requests)...${NC}"
+    echo ""
+    for i in 1 2 3 4 5; do
+        RESULT=$(curl -x "http://${PROXY_USER}:${PROXY_PASS}@127.0.0.1:${PROXY_PORT}" -s --max-time 10 http://httpbin.org/ip 2>/dev/null)
+        ORIGIN=$(echo "$RESULT" | grep -o '"origin": *"[^"]*"' | sed 's/"origin": *"//;s/"//')
+        if [ -n "$ORIGIN" ]; then
+            echo -e "  Request ${i}: ${GREEN}${ORIGIN}${NC}"
+        else
+            echo -e "  Request ${i}: ${RED}failed${NC}"
+        fi
+    done
+    echo ""
+    echo -e "${GREEN}${BOLD}Done! IPs added and proxy updated.${NC}"
+    exit 0
 fi
 
-echo ""
-echo -e "${BOLD}Configuration Summary:${NC}"
-echo -e "  Port     : ${GREEN}${PROXY_PORT}${NC}"
-echo -e "  Username : ${GREEN}${PROXY_USER}${NC}"
-echo -e "  Password : ${GREEN}${PROXY_PASS}${NC}"
-echo -e "  IP Pool  : ${GREEN}${IP_POOL[*]}${NC}"
-echo ""
-read -rp "Proceed with installation? [Y/n]: " CONFIRM < /dev/tty
-CONFIRM=${CONFIRM:-Y}
-if [[ ! "$CONFIRM" =~ ^[Yy] ]]; then
-    echo "Aborted."; exit 1
+# ═══════════════════════════════════════════════════════════════════════
+#  Full install / update begins here
+# ═══════════════════════════════════════════════════════════════════════
+
+STEP=1
+TOTAL=7
+if [ "$INSTALL_MODE" = "update_code" ]; then
+    TOTAL=4
 fi
 
+# ── Step: Dependencies ───────────────────────────────────────────────
 echo ""
-echo -e "${CYAN}[1/7] Updating system & installing dependencies...${NC}"
+echo -e "${CYAN}[${STEP}/${TOTAL}] Checking & installing dependencies...${NC}"
 export DEBIAN_FRONTEND=noninteractive
-apt-get update -qq
-apt-get install -y -qq python3 python3-pip python3-venv iptables curl net-tools lsof > /dev/null 2>&1
-pip3 install uvloop 2>/dev/null || pip3 install --break-system-packages uvloop 2>/dev/null || true
+PKGS_NEEDED=""
+for pkg in python3 python3-pip python3-venv iptables curl net-tools lsof; do
+    if ! dpkg -s "$pkg" > /dev/null 2>&1; then
+        PKGS_NEEDED="${PKGS_NEEDED} ${pkg}"
+    fi
+done
+if [ -n "$PKGS_NEEDED" ]; then
+    echo -e "  Installing missing:${PKGS_NEEDED}"
+    apt-get update -qq
+    apt-get install -y -qq $PKGS_NEEDED > /dev/null 2>&1
+else
+    echo -e "  ${GREEN}All packages already installed${NC}"
+fi
+python3 -c "import uvloop" 2>/dev/null || {
+    pip3 install uvloop 2>/dev/null || pip3 install --break-system-packages uvloop 2>/dev/null || true
+}
 echo -e "  ${GREEN}Done${NC}"
+STEP=$((STEP+1))
 
-echo -e "${CYAN}[2/7] Applying kernel tuning for high concurrency...${NC}"
+# ── Step: Kernel tuning ──────────────────────────────────────────────
+echo -e "${CYAN}[${STEP}/${TOTAL}] Applying kernel tuning...${NC}"
 cat > /etc/sysctl.d/99-proxy-tuning.conf << 'SYSCTL'
 net.core.somaxconn = 65535
 net.core.netdev_max_backlog = 65535
@@ -94,33 +277,10 @@ LIMITS
 
 ulimit -n 1048576 2>/dev/null || true
 echo -e "  ${GREEN}Done${NC}"
+STEP=$((STEP+1))
 
-echo -e "${CYAN}[3/7] Binding IP addresses to network interface...${NC}"
-IFACE=$(ip -4 route show default | awk '{print $5}' | head -1)
-for IP in "${IP_POOL[@]}"; do
-    if [ "$IP" != "$SERVER_IP" ]; then
-        if ! ip addr show dev "$IFACE" | grep -q "$IP"; then
-            ip addr add "${IP}/32" dev "$IFACE" 2>/dev/null || true
-            echo -e "  Added ${GREEN}${IP}${NC} to ${IFACE}"
-        else
-            echo -e "  ${IP} already bound"
-        fi
-    else
-        echo -e "  ${IP} (primary — already active)"
-    fi
-done
-echo -e "  ${GREEN}Done${NC}"
-
-echo -e "${CYAN}[4/7] Stopping any existing proxy services...${NC}"
-systemctl stop rotproxy 2>/dev/null || true
-systemctl disable rotproxy 2>/dev/null || true
-systemctl stop 3proxy 2>/dev/null || true
-systemctl disable 3proxy 2>/dev/null || true
-kill $(lsof -t -i:"${PROXY_PORT}") 2>/dev/null || true
-sleep 1
-echo -e "  ${GREEN}Done${NC}"
-
-echo -e "${CYAN}[5/7] Deploying proxy server...${NC}"
+# ── Step: Deploy proxy code ──────────────────────────────────────────
+echo -e "${CYAN}[${STEP}/${TOTAL}] Deploying proxy server code...${NC}"
 mkdir -p /usr/local/proxy/bin /usr/local/proxy/conf
 
 cat > /usr/local/proxy/bin/rotproxy.py << 'PROXYEOF'
@@ -389,24 +549,54 @@ if __name__ == "__main__":
 PROXYEOF
 
 chmod +x /usr/local/proxy/bin/rotproxy.py
-echo -e "  ${GREEN}Proxy code deployed${NC}"
+echo -e "  ${GREEN}Proxy code deployed (latest version)${NC}"
+STEP=$((STEP+1))
 
-# ── Build pool.json ──────────────────────────────────────────────────
-POOL_JSON="["
-FIRST=true
-for IP in "${IP_POOL[@]}"; do
-    ID=$(head -c 4 /dev/urandom | xxd -p)
-    if [ "$FIRST" = true ]; then FIRST=false; else POOL_JSON="${POOL_JSON},"; fi
-    POOL_JSON="${POOL_JSON}{\"id\":\"${ID}\",\"type\":\"local\",\"ip\":\"${IP}\",\"label\":\"\",\"enabled\":true}"
-done
-POOL_JSON="${POOL_JSON}]"
+# ── Steps only for fresh install ─────────────────────────────────────
+if [ "$INSTALL_MODE" = "fresh" ]; then
 
-echo "$POOL_JSON" | python3 -m json.tool > /usr/local/proxy/conf/pool.json
-echo -e "  ${GREEN}Pool config written (${#IP_POOL[@]} entries)${NC}"
-echo -e "  ${GREEN}Done${NC}"
+    echo -e "${CYAN}[${STEP}/${TOTAL}] Binding IP addresses...${NC}"
+    IFACE=$(ip -4 route show default | awk '{print $5}' | head -1)
+    for IP in "${IP_POOL[@]}"; do
+        if [ "$IP" != "$SERVER_IP" ]; then
+            if ! ip addr show dev "$IFACE" | grep -q "$IP"; then
+                ip addr add "${IP}/32" dev "$IFACE" 2>/dev/null || true
+                echo -e "  Added ${GREEN}${IP}${NC} to ${IFACE}"
+            else
+                echo -e "  ${IP} already bound"
+            fi
+        else
+            echo -e "  ${IP} (primary — already active)"
+        fi
+    done
+    echo -e "  ${GREEN}Done${NC}"
+    STEP=$((STEP+1))
 
-echo -e "${CYAN}[6/7] Creating systemd service...${NC}"
-cat > /etc/systemd/system/rotproxy.service << SVCEOF
+    echo -e "${CYAN}[${STEP}/${TOTAL}] Stopping any existing proxy services...${NC}"
+    systemctl stop rotproxy 2>/dev/null || true
+    systemctl disable rotproxy 2>/dev/null || true
+    systemctl stop 3proxy 2>/dev/null || true
+    systemctl disable 3proxy 2>/dev/null || true
+    kill $(lsof -t -i:"${PROXY_PORT}") 2>/dev/null || true
+    sleep 1
+    echo -e "  ${GREEN}Done${NC}"
+    STEP=$((STEP+1))
+
+    echo -e "${CYAN}[${STEP}/${TOTAL}] Building pool config...${NC}"
+    POOL_JSON="["
+    FIRST=true
+    for IP in "${IP_POOL[@]}"; do
+        ID=$(head -c 4 /dev/urandom | xxd -p)
+        if [ "$FIRST" = true ]; then FIRST=false; else POOL_JSON="${POOL_JSON},"; fi
+        POOL_JSON="${POOL_JSON}{\"id\":\"${ID}\",\"type\":\"local\",\"ip\":\"${IP}\",\"label\":\"\",\"enabled\":true}"
+    done
+    POOL_JSON="${POOL_JSON}]"
+    echo "$POOL_JSON" | python3 -m json.tool > /usr/local/proxy/conf/pool.json
+    echo -e "  ${GREEN}Pool config written (${#IP_POOL[@]} entries)${NC}"
+    STEP=$((STEP+1))
+
+    echo -e "${CYAN}[${STEP}/${TOTAL}] Creating systemd service...${NC}"
+    cat > /etc/systemd/system/rotproxy.service << SVCEOF
 [Unit]
 Description=High-Concurrency Rotating Proxy
 After=network.target
@@ -428,20 +618,22 @@ KillMode=process
 WantedBy=multi-user.target
 SVCEOF
 
-systemctl daemon-reload
-systemctl enable rotproxy
-systemctl start rotproxy
-sleep 2
-echo -e "  ${GREEN}Done${NC}"
+    systemctl daemon-reload
+    systemctl enable rotproxy
+    echo -e "  ${GREEN}Done${NC}"
+    STEP=$((STEP+1))
 
-echo -e "${CYAN}[7/7] Configuring firewall...${NC}"
-iptables -I INPUT -p tcp --dport "${PROXY_PORT}" -j ACCEPT 2>/dev/null || true
-iptables -I INPUT -p tcp --dport 22 -j ACCEPT 2>/dev/null || true
-echo -e "  ${GREEN}Done${NC}"
+    echo -e "${CYAN}[${STEP}/${TOTAL}] Configuring firewall...${NC}"
+    iptables -I INPUT -p tcp --dport "${PROXY_PORT}" -j ACCEPT 2>/dev/null || true
+    iptables -I INPUT -p tcp --dport 22 -j ACCEPT 2>/dev/null || true
+    echo -e "  ${GREEN}Done${NC}"
+fi
 
+# ── Restart proxy ────────────────────────────────────────────────────
 echo ""
-echo -e "${CYAN}Verifying proxy...${NC}"
-sleep 1
+echo -e "${CYAN}Restarting proxy...${NC}"
+systemctl restart rotproxy
+sleep 2
 
 WORKERS_RUNNING=$(pgrep -f rotproxy.py -c 2>/dev/null || echo 0)
 if [ "$WORKERS_RUNNING" -gt 0 ]; then
@@ -450,28 +642,20 @@ else
     echo -e "  ${RED}Proxy may not be running. Check: journalctl -u rotproxy -n 20${NC}"
 fi
 
-TEST_RESULT=$(curl -x "http://${PROXY_USER}:${PROXY_PASS}@127.0.0.1:${PROXY_PORT}" -s --max-time 10 http://httpbin.org/ip 2>/dev/null || echo "FAIL")
-if echo "$TEST_RESULT" | grep -q "origin"; then
-    ORIGIN=$(echo "$TEST_RESULT" | grep -o '"origin": *"[^"]*"' | head -1)
-    echo -e "  ${GREEN}Test passed: ${ORIGIN}${NC}"
-else
-    echo -e "  ${YELLOW}Test inconclusive. Proxy may still be starting up.${NC}"
-fi
-
+# ── Summary ──────────────────────────────────────────────────────────
 echo ""
 echo -e "${CYAN}══════════════════════════════════════════════════════════════${NC}"
-echo -e "${GREEN}${BOLD}  SETUP COMPLETE${NC}"
+if [ "$INSTALL_MODE" = "update_code" ]; then
+    echo -e "${GREEN}${BOLD}  UPDATE COMPLETE${NC}"
+else
+    echo -e "${GREEN}${BOLD}  SETUP COMPLETE${NC}"
+fi
 echo -e "${CYAN}══════════════════════════════════════════════════════════════${NC}"
 echo -e "  Proxy Address : ${GREEN}${SERVER_IP}:${PROXY_PORT}${NC}"
 echo -e "  Username      : ${GREEN}${PROXY_USER}${NC}"
 echo -e "  Password      : ${GREEN}${PROXY_PASS}${NC}"
-echo -e "  IP Pool       : ${GREEN}${#IP_POOL[@]} addresses${NC}"
 echo -e "  Workers       : ${GREEN}$(nproc) (1 per CPU)${NC}"
 echo -e "  Rotation      : ${GREEN}Per-request round-robin${NC}"
-echo -e "${CYAN}──────────────────────────────────────────────────────────────${NC}"
-echo -e "  ${BOLD}Test:${NC}"
-echo -e "  curl -x http://${PROXY_USER}:${PROXY_PASS}@${SERVER_IP}:${PROXY_PORT} http://httpbin.org/ip"
-echo -e "  curl -x http://${PROXY_USER}:${PROXY_PASS}@${SERVER_IP}:${PROXY_PORT} https://httpbin.org/ip"
 echo -e "${CYAN}──────────────────────────────────────────────────────────────${NC}"
 echo -e "  ${BOLD}Management:${NC}"
 echo -e "  Pool config : /usr/local/proxy/conf/pool.json"
@@ -479,3 +663,19 @@ echo -e "  Restart     : systemctl restart rotproxy"
 echo -e "  Logs        : journalctl -u rotproxy -f"
 echo -e "  Status      : systemctl status rotproxy"
 echo -e "${CYAN}══════════════════════════════════════════════════════════════${NC}"
+
+# ── Rotation test ────────────────────────────────────────────────────
+echo ""
+echo -e "${CYAN}Running rotation test (5 requests)...${NC}"
+echo ""
+for i in 1 2 3 4 5; do
+    RESULT=$(curl -x "http://${PROXY_USER}:${PROXY_PASS}@127.0.0.1:${PROXY_PORT}" -s --max-time 10 http://httpbin.org/ip 2>/dev/null)
+    ORIGIN=$(echo "$RESULT" | grep -o '"origin": *"[^"]*"' | sed 's/"origin": *"//;s/"//')
+    if [ -n "$ORIGIN" ]; then
+        echo -e "  Request ${i}: ${GREEN}${ORIGIN}${NC}"
+    else
+        echo -e "  Request ${i}: ${RED}failed${NC}"
+    fi
+done
+echo ""
+echo -e "${GREEN}${BOLD}Done! Proxy is ready to use.${NC}"
