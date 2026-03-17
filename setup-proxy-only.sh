@@ -1,51 +1,39 @@
 #!/bin/bash
 set -euo pipefail
 
-# ═══════════════════════════════════════════════════════════════════════
-#  All-in-One High-Concurrency Rotating Proxy Setup
-#  Features: Multi-worker, per-request IP rotation, upstream proxy
-#            chaining, username/password auth, DNS caching, uvloop,
-#            kernel tuning, pool management via JSON config
-# ═══════════════════════════════════════════════════════════════════════
-
 RED='\033[0;31m'; GREEN='\033[0;32m'; CYAN='\033[0;36m'; YELLOW='\033[1;33m'; NC='\033[0m'; BOLD='\033[1m'
 
-banner() {
-    echo -e "${CYAN}"
-    echo "╔══════════════════════════════════════════════════════════════╗"
-    echo "║          High-Concurrency Rotating Proxy Installer          ║"
-    echo "╠══════════════════════════════════════════════════════════════╣"
-    echo "║  Multi-worker  │  IP Rotation  │  Upstream Chaining         ║"
-    echo "║  uvloop        │  DNS Cache    │  BBR Congestion Control    ║"
-    echo "╚══════════════════════════════════════════════════════════════╝"
-    echo -e "${NC}"
-}
+echo -e "${CYAN}"
+echo "╔══════════════════════════════════════════════════════════════╗"
+echo "║          High-Concurrency Rotating Proxy Installer          ║"
+echo "╠══════════════════════════════════════════════════════════════╣"
+echo "║  Multi-worker  │  IP Rotation  │  Upstream Chaining         ║"
+echo "║  uvloop        │  DNS Cache    │  BBR Congestion Control    ║"
+echo "╚══════════════════════════════════════════════════════════════╝"
+echo -e "${NC}"
 
-banner
-
-# ── Gather configuration ─────────────────────────────────────────────
 SERVER_IP=$(hostname -I | awk '{print $1}')
 echo -e "${BOLD}Server detected IP:${NC} ${GREEN}${SERVER_IP}${NC}"
 echo ""
 
-read -rp "$(echo -e "${YELLOW}Proxy port [8088]:${NC} ")" PROXY_PORT
+read -rp "Proxy port [8088]: " PROXY_PORT < /dev/tty
 PROXY_PORT=${PROXY_PORT:-8088}
 
-read -rp "$(echo -e "${YELLOW}Proxy username [proxyuser]:${NC} ")" PROXY_USER
+read -rp "Proxy username [proxyuser]: " PROXY_USER < /dev/tty
 PROXY_USER=${PROXY_USER:-proxyuser}
 
-read -rp "$(echo -e "${YELLOW}Proxy password [$(openssl rand -base64 16 | tr -d '/+=' | head -c 20)]:${NC} ")" PROXY_PASS
-if [ -z "$PROXY_PASS" ]; then
-    PROXY_PASS=$(openssl rand -base64 16 | tr -d '/+=' | head -c 20)
-    echo -e "  Generated password: ${GREEN}${PROXY_PASS}${NC}"
-fi
+DEFAULT_PASS=$(openssl rand -base64 16 | tr -d '/+=' | head -c 20)
+read -rp "Proxy password [${DEFAULT_PASS}]: " PROXY_PASS < /dev/tty
+PROXY_PASS=${PROXY_PASS:-$DEFAULT_PASS}
 
-read -rp "$(echo -e "${YELLOW}Local IPs for rotation (comma-separated, blank = server IP only):${NC} ")" IP_INPUT
+read -rp "Local IPs for rotation (comma-separated, blank = server IP only): " IP_INPUT < /dev/tty
 if [ -z "$IP_INPUT" ]; then
     IP_POOL=("$SERVER_IP")
 else
     IFS=',' read -ra IP_POOL <<< "$IP_INPUT"
-    IP_POOL=("${IP_POOL[@]// /}")
+    for i in "${!IP_POOL[@]}"; do
+        IP_POOL[$i]=$(echo "${IP_POOL[$i]}" | tr -d ' ')
+    done
 fi
 
 echo ""
@@ -55,7 +43,7 @@ echo -e "  Username : ${GREEN}${PROXY_USER}${NC}"
 echo -e "  Password : ${GREEN}${PROXY_PASS}${NC}"
 echo -e "  IP Pool  : ${GREEN}${IP_POOL[*]}${NC}"
 echo ""
-read -rp "$(echo -e "${YELLOW}Proceed with installation? [Y/n]:${NC} ")" CONFIRM
+read -rp "Proceed with installation? [Y/n]: " CONFIRM < /dev/tty
 CONFIRM=${CONFIRM:-Y}
 if [[ ! "$CONFIRM" =~ ^[Yy] ]]; then
     echo "Aborted."; exit 1
@@ -135,31 +123,10 @@ echo -e "  ${GREEN}Done${NC}"
 echo -e "${CYAN}[5/7] Deploying proxy server...${NC}"
 mkdir -p /usr/local/proxy/bin /usr/local/proxy/conf
 
-# ── Write the proxy Python code ──────────────────────────────────────
 cat > /usr/local/proxy/bin/rotproxy.py << 'PROXYEOF'
 #!/usr/bin/env python3
-"""
-Multi-worker rotating proxy with support for both local IPs and upstream proxies.
-
-Pool entries are loaded from a JSON file.
-Each entry is either:
-  - {"type":"local", "ip":"1.2.3.4", ...}
-  - {"type":"upstream", "host":"px.io", "port":8080, "username":"u", "password":"p", ...}
-
-Reload pool at runtime: kill -HUP <pid>  (or systemctl restart rotproxy)
-"""
-
-import asyncio
-import base64
-import itertools
-import json
-import logging
-import multiprocessing
-import os
-import signal
-import socket
-import sys
-import time
+import asyncio, base64, itertools, json, logging, multiprocessing
+import os, signal, socket, sys, time
 from urllib.parse import urlparse
 
 LISTEN      = os.getenv("PROXY_LISTEN", "0.0.0.0")
@@ -172,14 +139,12 @@ BUF         = 262144
 TIMEOUT     = 15
 DNS_TTL     = 300
 
-logging.basicConfig(
-    level=logging.INFO,
+logging.basicConfig(level=logging.INFO,
     format="%(asctime)s [%(levelname)s] [w%(process)d] %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-)
+    datefmt="%Y-%m-%d %H:%M:%S")
 log = logging.getLogger("rotproxy")
 
-_dns_cache: dict = {}
+_dns_cache = {}
 
 async def cached_resolve(host, port):
     key = f"{host}:{port}"; now = time.monotonic()
@@ -206,23 +171,21 @@ RESP_431 = b"HTTP/1.1 431 Header Too Large\r\nContent-Length: 0\r\n\r\n"
 
 def check_auth_fast(hdrs):
     raw = hdrs.get(b"proxy-authorization", b"")
-    if not raw:
-        return False
+    if not raw: return False
     try:
         _, blob = raw.split(None, 1)
         return base64.b64decode(blob).decode() == f"{AUTH_USER}:{AUTH_PASS}"
-    except Exception:
-        return False
+    except Exception: return False
 
 def parse_headers_fast(raw):
     hdrs = {}
     for line in raw.split(b"\r\n"):
         idx = line.find(b":")
         if idx > 0:
-            hdrs[line[:idx].strip().lower()] = line[idx + 1:].strip()
+            hdrs[line[:idx].strip().lower()] = line[idx+1:].strip()
     return hdrs
 
-pool_entries: list[dict] = []
+pool_entries = []
 pool_cycle = None
 
 def load_pool():
@@ -241,21 +204,18 @@ def load_pool():
                 else:
                     log.info("  Upstream: %s:%s", e.get("host"), e.get("port"))
         else:
-            log.warning("Pool is empty!")
-            pool_cycle = None
+            log.warning("Pool is empty!"); pool_cycle = None
     except FileNotFoundError:
-        log.warning("Pool file not found: %s — using env fallback", POOL_FILE)
+        log.warning("Pool file not found: %s", POOL_FILE)
         ip_str = os.getenv("PROXY_IP_POOL", "")
         ips = [ip.strip() for ip in ip_str.split(",") if ip.strip()]
-        pool_entries = [{"type": "local", "ip": ip, "id": str(i), "enabled": True} for i, ip in enumerate(ips)]
+        pool_entries = [{"type":"local","ip":ip,"id":str(i),"enabled":True} for i,ip in enumerate(ips)]
         pool_cycle = itertools.cycle(pool_entries) if pool_entries else None
     except Exception as exc:
-        log.error("Failed to load pool: %s", exc)
-        pool_cycle = None
+        log.error("Failed to load pool: %s", exc); pool_cycle = None
 
 def next_entry():
-    if pool_cycle is None:
-        return None
+    if pool_cycle is None: return None
     return next(pool_cycle)
 
 async def open_remote_local(host, port, source_ip):
@@ -266,19 +226,15 @@ async def open_remote_local(host, port, source_ip):
     sock.setblocking(False)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-    try:
-        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_QUICKACK, 1)
-    except (AttributeError, OSError):
-        pass
+    try: sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_QUICKACK, 1)
+    except (AttributeError, OSError): pass
     sock.bind((source_ip, 0))
     await asyncio.wait_for(loop.sock_connect(sock, sa), timeout=TIMEOUT)
     return await asyncio.open_connection(sock=sock)
 
 async def open_upstream_connect(target_host, target_port, entry):
     ur, uw = await asyncio.wait_for(
-        asyncio.open_connection(entry["host"], int(entry["port"])),
-        timeout=TIMEOUT,
-    )
+        asyncio.open_connection(entry["host"], int(entry["port"])), timeout=TIMEOUT)
     connect_req = f"CONNECT {target_host}:{target_port} HTTP/1.1\r\nHost: {target_host}:{target_port}\r\n"
     up_user = entry.get("username", "")
     up_pass = entry.get("password", "")
@@ -286,106 +242,77 @@ async def open_upstream_connect(target_host, target_port, entry):
         cred = base64.b64encode(f"{up_user}:{up_pass}".encode()).decode()
         connect_req += f"Proxy-Authorization: Basic {cred}\r\n"
     connect_req += "\r\n"
-    uw.write(connect_req.encode())
-    await uw.drain()
+    uw.write(connect_req.encode()); await uw.drain()
     resp_line = await asyncio.wait_for(ur.readline(), timeout=TIMEOUT)
     if b"200" not in resp_line:
         uw.close()
         raise ConnectionError(f"Upstream CONNECT failed: {resp_line.decode(errors='replace').strip()}")
     while True:
         hdr = await asyncio.wait_for(ur.readline(), timeout=TIMEOUT)
-        if hdr in (b"\r\n", b"\n", b""):
-            break
+        if hdr in (b"\r\n", b"\n", b""): break
     return ur, uw
 
 async def open_upstream_http(target_host, target_port, entry):
     ur, uw = await asyncio.wait_for(
-        asyncio.open_connection(entry["host"], int(entry["port"])),
-        timeout=TIMEOUT,
-    )
+        asyncio.open_connection(entry["host"], int(entry["port"])), timeout=TIMEOUT)
     return ur, uw
 
 async def relay(reader, writer):
     try:
         while True:
             data = await reader.read(BUF)
-            if not data:
-                break
+            if not data: break
             writer.write(data)
             if writer.transport.get_write_buffer_size() > BUF:
                 await writer.drain()
         if writer.transport and not writer.transport.is_closing():
             await writer.drain()
     except (ConnectionError, asyncio.CancelledError, OSError,
-            asyncio.IncompleteReadError, AttributeError):
-        pass
+            asyncio.IncompleteReadError, AttributeError): pass
     finally:
         try:
-            if not writer.is_closing():
-                writer.close()
-        except Exception:
-            pass
+            if not writer.is_closing(): writer.close()
+        except Exception: pass
 
 async def handle(cr, cw):
     rw = None
     try:
         sock = cw.get_extra_info("socket")
-        if sock:
-            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-
+        if sock: sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         client_addr = cw.get_extra_info("peername", ("?", 0))
         req_line = await asyncio.wait_for(cr.readline(), timeout=30)
-        if not req_line:
-            return
-
+        if not req_line: return
         hdr_buf = b""
         while True:
             line = await asyncio.wait_for(cr.readline(), timeout=30)
-            if line in (b"\r\n", b"\n", b""):
-                break
+            if line in (b"\r\n", b"\n", b""): break
             hdr_buf += line
-            if len(hdr_buf) > 65536:
-                cw.write(RESP_431); return
-
+            if len(hdr_buf) > 65536: cw.write(RESP_431); return
         hdrs = parse_headers_fast(hdr_buf)
-
         if not check_auth_fast(hdrs):
             cw.write(RESP_407); await cw.drain(); return
-
         parts = req_line.split(None, 2)
-        if len(parts) < 2:
-            cw.write(RESP_400); return
-        method = parts[0]
-        target = parts[1].decode(errors="replace")
-
+        if len(parts) < 2: cw.write(RESP_400); return
+        method = parts[0]; target = parts[1].decode(errors="replace")
         entry = next_entry()
-        if entry is None:
-            cw.write(RESP_502); await cw.drain(); return
-
+        if entry is None: cw.write(RESP_502); await cw.drain(); return
         etype = entry.get("type", "local")
-        elabel = entry.get("ip") if etype == "local" else f"{entry.get('host', '?')}:{entry.get('port', '?')}"
-
+        elabel = entry.get("ip") if etype == "local" else f"{entry.get('host','?')}:{entry.get('port','?')}"
         if method == b"CONNECT":
             host, _, port = target.rpartition(":")
             port = int(port) if port else 443
             try:
-                if etype == "local":
-                    rr, rw = await open_remote_local(host, port, entry["ip"])
-                else:
-                    rr, rw = await open_upstream_connect(host, port, entry)
-            except Exception:
-                cw.write(RESP_502); await cw.drain(); return
+                if etype == "local": rr, rw = await open_remote_local(host, port, entry["ip"])
+                else: rr, rw = await open_upstream_connect(host, port, entry)
+            except Exception: cw.write(RESP_502); await cw.drain(); return
             log.info("%s -> %s:%s via %s (CONNECT)", client_addr[0], host, port, elabel)
             cw.write(RESP_200); await cw.drain()
             await asyncio.gather(relay(cr, rw), relay(rr, cw), return_exceptions=True)
-
         else:
             parsed = urlparse(target)
-            host = parsed.hostname or ""
-            port = parsed.port or 80
+            host = parsed.hostname or ""; port = parsed.port or 80
             path = parsed.path or "/"
-            if parsed.query:
-                path += "?" + parsed.query
+            if parsed.query: path += "?" + parsed.query
             try:
                 if etype == "local":
                     rr, rw = await open_remote_local(host, port, entry["ip"])
@@ -396,16 +323,13 @@ async def handle(cr, cw):
                             k = raw_line.split(b":", 1)[0].lower()
                             if k not in (b"proxy-authorization", b"proxy-connection"):
                                 fwd.extend(raw_line + b"\r\n")
-                    if b"host" not in hdrs:
-                        fwd.extend(f"Host: {host}\r\n".encode())
-                    fwd.extend(b"\r\n")
-                    rw.write(fwd); await rw.drain()
+                    if b"host" not in hdrs: fwd.extend(f"Host: {host}\r\n".encode())
+                    fwd.extend(b"\r\n"); rw.write(fwd); await rw.drain()
                 else:
                     rr, rw = await open_upstream_http(host, port, entry)
                     log.info("%s -> %s:%s via %s (%s)", client_addr[0], host, port, elabel, method.decode(errors="replace"))
                     fwd = bytearray(method + b" " + target.encode() + b" HTTP/1.1\r\n")
-                    up_user = entry.get("username", "")
-                    up_pass = entry.get("password", "")
+                    up_user = entry.get("username", ""); up_pass = entry.get("password", "")
                     if up_user:
                         cred = base64.b64encode(f"{up_user}:{up_pass}".encode()).decode()
                         fwd.extend(f"Proxy-Authorization: Basic {cred}\r\n".encode())
@@ -414,32 +338,22 @@ async def handle(cr, cw):
                             k = raw_line.split(b":", 1)[0].lower()
                             if k not in (b"proxy-authorization", b"proxy-connection"):
                                 fwd.extend(raw_line + b"\r\n")
-                    if b"host" not in hdrs:
-                        fwd.extend(f"Host: {host}\r\n".encode())
-                    fwd.extend(b"\r\n")
-                    rw.write(fwd); await rw.drain()
-            except Exception:
-                cw.write(RESP_502); await cw.drain(); return
+                    if b"host" not in hdrs: fwd.extend(f"Host: {host}\r\n".encode())
+                    fwd.extend(b"\r\n"); rw.write(fwd); await rw.drain()
+            except Exception: cw.write(RESP_502); await cw.drain(); return
             await relay(rr, cw)
-
-    except (ConnectionError, asyncio.CancelledError, asyncio.TimeoutError, OSError):
-        pass
-    except Exception as exc:
-        log.error("handle error: %s", exc)
+    except (ConnectionError, asyncio.CancelledError, asyncio.TimeoutError, OSError): pass
+    except Exception as exc: log.error("handle error: %s", exc)
     finally:
         for w in (cw, rw):
             if w is not None:
                 try:
-                    if not w.is_closing():
-                        w.close()
-                except Exception:
-                    pass
+                    if not w.is_closing(): w.close()
+                except Exception: pass
 
 def run_worker(wid):
-    try:
-        import uvloop; uvloop.install()
-    except ImportError:
-        pass
+    try: import uvloop; uvloop.install()
+    except ImportError: pass
     load_pool()
     async def _serve():
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -451,8 +365,7 @@ def run_worker(wid):
         log.info("Worker %d listening on %s:%d", wid, LISTEN, PORT)
         loop = asyncio.get_running_loop()
         loop.add_signal_handler(signal.SIGHUP, load_pool)
-        async with srv:
-            await srv.serve_forever()
+        async with srv: await srv.serve_forever()
     asyncio.run(_serve())
 
 def main():
@@ -465,13 +378,11 @@ def main():
         p.start(); children.append(p)
     def shutdown(sig, frame):
         log.info("Shutting down...")
-        for p in children:
-            p.terminate()
+        for p in children: p.terminate()
         sys.exit(0)
     signal.signal(signal.SIGTERM, shutdown)
     signal.signal(signal.SIGINT, shutdown)
-    for p in children:
-        p.join()
+    for p in children: p.join()
 
 if __name__ == "__main__":
     main()
@@ -483,22 +394,15 @@ echo -e "  ${GREEN}Proxy code deployed${NC}"
 # ── Build pool.json ──────────────────────────────────────────────────
 POOL_JSON="["
 FIRST=true
-IDX=1
 for IP in "${IP_POOL[@]}"; do
     ID=$(head -c 4 /dev/urandom | xxd -p)
-    if [ "$FIRST" = true ]; then FIRST=false; else POOL_JSON+=","; fi
-    POOL_JSON+=$(cat <<JEOF
-
-  {"id":"${ID}","type":"local","ip":"${IP}","label":"","enabled":true}
-JEOF
-)
-    IDX=$((IDX+1))
+    if [ "$FIRST" = true ]; then FIRST=false; else POOL_JSON="${POOL_JSON},"; fi
+    POOL_JSON="${POOL_JSON}{\"id\":\"${ID}\",\"type\":\"local\",\"ip\":\"${IP}\",\"label\":\"\",\"enabled\":true}"
 done
-POOL_JSON+=$'\n]'
+POOL_JSON="${POOL_JSON}]"
 
-echo "$POOL_JSON" > /usr/local/proxy/conf/pool.json
+echo "$POOL_JSON" | python3 -m json.tool > /usr/local/proxy/conf/pool.json
 echo -e "  ${GREEN}Pool config written (${#IP_POOL[@]} entries)${NC}"
-
 echo -e "  ${GREEN}Done${NC}"
 
 echo -e "${CYAN}[6/7] Creating systemd service...${NC}"
@@ -535,7 +439,6 @@ iptables -I INPUT -p tcp --dport "${PROXY_PORT}" -j ACCEPT 2>/dev/null || true
 iptables -I INPUT -p tcp --dport 22 -j ACCEPT 2>/dev/null || true
 echo -e "  ${GREEN}Done${NC}"
 
-# ── Verify ───────────────────────────────────────────────────────────
 echo ""
 echo -e "${CYAN}Verifying proxy...${NC}"
 sleep 1
@@ -544,43 +447,35 @@ WORKERS_RUNNING=$(pgrep -f rotproxy.py -c 2>/dev/null || echo 0)
 if [ "$WORKERS_RUNNING" -gt 0 ]; then
     echo -e "  ${GREEN}Proxy is running (${WORKERS_RUNNING} processes)${NC}"
 else
-    echo -e "  ${RED}Proxy may not be running — check: journalctl -u rotproxy -n 20${NC}"
+    echo -e "  ${RED}Proxy may not be running. Check: journalctl -u rotproxy -n 20${NC}"
 fi
 
 TEST_RESULT=$(curl -x "http://${PROXY_USER}:${PROXY_PASS}@127.0.0.1:${PROXY_PORT}" -s --max-time 10 http://httpbin.org/ip 2>/dev/null || echo "FAIL")
 if echo "$TEST_RESULT" | grep -q "origin"; then
     ORIGIN=$(echo "$TEST_RESULT" | grep -o '"origin": *"[^"]*"' | head -1)
-    echo -e "  ${GREEN}Test passed — ${ORIGIN}${NC}"
+    echo -e "  ${GREEN}Test passed: ${ORIGIN}${NC}"
 else
-    echo -e "  ${YELLOW}Test inconclusive — proxy may still be starting up${NC}"
+    echo -e "  ${YELLOW}Test inconclusive. Proxy may still be starting up.${NC}"
 fi
 
-# ── Print summary ────────────────────────────────────────────────────
 echo ""
-echo -e "${CYAN}╔══════════════════════════════════════════════════════════════╗${NC}"
-echo -e "${CYAN}║                    SETUP COMPLETE                           ║${NC}"
-echo -e "${CYAN}╠══════════════════════════════════════════════════════════════╣${NC}"
-echo -e "${CYAN}║${NC}  Proxy Address : ${GREEN}${SERVER_IP}:${PROXY_PORT}${NC}"
-echo -e "${CYAN}║${NC}  Username      : ${GREEN}${PROXY_USER}${NC}"
-echo -e "${CYAN}║${NC}  Password      : ${GREEN}${PROXY_PASS}${NC}"
-echo -e "${CYAN}║${NC}  IP Pool       : ${GREEN}${#IP_POOL[@]} addresses${NC}"
-echo -e "${CYAN}║${NC}  Workers       : ${GREEN}$(nproc) (1 per CPU)${NC}"
-echo -e "${CYAN}║${NC}  Rotation      : ${GREEN}Per-request round-robin${NC}"
-echo -e "${CYAN}╠══════════════════════════════════════════════════════════════╣${NC}"
-echo -e "${CYAN}║${NC}  ${BOLD}Test commands:${NC}"
-echo -e "${CYAN}║${NC}  curl -x http://${PROXY_USER}:${PROXY_PASS}@${SERVER_IP}:${PROXY_PORT} http://httpbin.org/ip"
-echo -e "${CYAN}║${NC}  curl -x http://${PROXY_USER}:${PROXY_PASS}@${SERVER_IP}:${PROXY_PORT} https://httpbin.org/ip"
-echo -e "${CYAN}╠══════════════════════════════════════════════════════════════╣${NC}"
-echo -e "${CYAN}║${NC}  ${BOLD}Management:${NC}"
-echo -e "${CYAN}║${NC}  Pool config   : /usr/local/proxy/conf/pool.json"
-echo -e "${CYAN}║${NC}  Proxy code    : /usr/local/proxy/bin/rotproxy.py"
-echo -e "${CYAN}║${NC}  Restart       : systemctl restart rotproxy"
-echo -e "${CYAN}║${NC}  Logs          : journalctl -u rotproxy -f"
-echo -e "${CYAN}║${NC}  Status        : systemctl status rotproxy"
-echo -e "${CYAN}╠══════════════════════════════════════════════════════════════╣${NC}"
-echo -e "${CYAN}║${NC}  ${BOLD}Add upstream proxy to pool:${NC}"
-echo -e "${CYAN}║${NC}  Edit /usr/local/proxy/conf/pool.json and add:"
-echo -e "${CYAN}║${NC}  {\"id\":\"xx\",\"type\":\"upstream\",\"host\":\"1.2.3.4\","
-echo -e "${CYAN}║${NC}   \"port\":8080,\"username\":\"u\",\"password\":\"p\",\"enabled\":true}"
-echo -e "${CYAN}║${NC}  Then: systemctl restart rotproxy"
-echo -e "${CYAN}╚══════════════════════════════════════════════════════════════╝${NC}"
+echo -e "${CYAN}══════════════════════════════════════════════════════════════${NC}"
+echo -e "${GREEN}${BOLD}  SETUP COMPLETE${NC}"
+echo -e "${CYAN}══════════════════════════════════════════════════════════════${NC}"
+echo -e "  Proxy Address : ${GREEN}${SERVER_IP}:${PROXY_PORT}${NC}"
+echo -e "  Username      : ${GREEN}${PROXY_USER}${NC}"
+echo -e "  Password      : ${GREEN}${PROXY_PASS}${NC}"
+echo -e "  IP Pool       : ${GREEN}${#IP_POOL[@]} addresses${NC}"
+echo -e "  Workers       : ${GREEN}$(nproc) (1 per CPU)${NC}"
+echo -e "  Rotation      : ${GREEN}Per-request round-robin${NC}"
+echo -e "${CYAN}──────────────────────────────────────────────────────────────${NC}"
+echo -e "  ${BOLD}Test:${NC}"
+echo -e "  curl -x http://${PROXY_USER}:${PROXY_PASS}@${SERVER_IP}:${PROXY_PORT} http://httpbin.org/ip"
+echo -e "  curl -x http://${PROXY_USER}:${PROXY_PASS}@${SERVER_IP}:${PROXY_PORT} https://httpbin.org/ip"
+echo -e "${CYAN}──────────────────────────────────────────────────────────────${NC}"
+echo -e "  ${BOLD}Management:${NC}"
+echo -e "  Pool config : /usr/local/proxy/conf/pool.json"
+echo -e "  Restart     : systemctl restart rotproxy"
+echo -e "  Logs        : journalctl -u rotproxy -f"
+echo -e "  Status      : systemctl status rotproxy"
+echo -e "${CYAN}══════════════════════════════════════════════════════════════${NC}"
