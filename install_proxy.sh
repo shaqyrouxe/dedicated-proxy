@@ -121,19 +121,43 @@ progress "Installing dependencies..."
 
 if [ "$PKG" = "apt" ]; then
     export DEBIAN_FRONTEND=noninteractive
-    apt-get update -qq >/dev/null 2>&1 || true
-    if ! apt-get install -y -qq build-essential git curl wget net-tools unbound dns-utils openssl >/dev/null 2>&1; then
-        warn "Some packages may have failed — continuing..."
+
+    # Kill any stuck apt/dpkg processes
+    killall -9 apt-get 2>/dev/null || true
+    killall -9 dpkg 2>/dev/null || true
+    sleep 1
+
+    # Fix any broken dpkg state
+    dpkg --configure -a >/dev/null 2>&1 || true
+    rm -f /var/lib/dpkg/lock-frontend /var/lib/apt/lists/lock /var/cache/apt/archives/lock 2>/dev/null
+
+    echo -e "  ${DIM}→ Updating package lists...${NC}"
+    apt-get update -y >/dev/null 2>&1 || true
+
+    echo -e "  ${DIM}→ Installing packages...${NC}"
+    if ! apt-get install -y build-essential git curl wget net-tools unbound dns-utils openssl >/dev/null 2>&1; then
+        warn "First attempt failed — retrying..."
+        apt-get update -y >/dev/null 2>&1 || true
+        dpkg --configure -a >/dev/null 2>&1 || true
+        apt-get install -y -f >/dev/null 2>&1 || true
+        if ! apt-get install -y build-essential git curl wget net-tools unbound dns-utils openssl >/dev/null 2>&1; then
+            warn "Some packages may have failed"
+        fi
     fi
 else
+    echo -e "  ${DIM}→ Installing packages...${NC}"
     if ! yum install -y -q gcc make git curl wget net-tools unbound bind-utils openssl >/dev/null 2>&1; then
-        warn "Some packages may have failed — continuing..."
+        warn "First attempt failed — retrying..."
+        yum clean all >/dev/null 2>&1 || true
+        if ! yum install -y -q gcc make git curl wget net-tools unbound bind-utils openssl >/dev/null 2>&1; then
+            warn "Some packages may have failed"
+        fi
     fi
 fi
 
 for cmd in git gcc make curl openssl; do
     if ! command -v $cmd &>/dev/null; then
-        fail "Required command '$cmd' not found. Install it manually and retry."
+        fail "Required command '$cmd' not found after install. Run manually:\n\n  apt-get update && apt-get install -y build-essential git curl openssl\n\n  Then re-run this script."
     fi
 done
 echo -e "  ${DIM}→ build-essential, git, curl, unbound, openssl${NC}"
@@ -173,11 +197,12 @@ if command -v squid &>/dev/null || systemctl cat squid.service &>/dev/null 2>&1;
     systemctl stop squid 2>/dev/null || true
     systemctl disable squid 2>/dev/null || true
     if [ "$PKG" = "apt" ]; then
-        apt-get purge -y -qq squid squid-common 2>/dev/null || true
+        apt-get purge -y squid squid-common >/dev/null 2>&1 || true
+        apt-get autoremove -y >/dev/null 2>&1 || true
     else
-        yum remove -y -q squid 2>/dev/null || true
+        yum remove -y squid >/dev/null 2>&1 || true
     fi
-    rm -rf /etc/squid 2>/dev/null
+    rm -rf /etc/squid /var/log/squid /var/spool/squid 2>/dev/null
     FOUND_OLD=1
     echo -e "  ${DIM}→ Squid removed${NC}"
 fi
@@ -187,9 +212,9 @@ if command -v sockd &>/dev/null || systemctl cat danted.service &>/dev/null 2>&1
     systemctl stop danted 2>/dev/null || true
     systemctl disable danted 2>/dev/null || true
     if [ "$PKG" = "apt" ]; then
-        apt-get purge -y -qq dante-server 2>/dev/null || true
+        apt-get purge -y dante-server >/dev/null 2>&1 || true
     else
-        yum remove -y -q dante-server 2>/dev/null || true
+        yum remove -y dante-server >/dev/null 2>&1 || true
     fi
     FOUND_OLD=1
     echo -e "  ${DIM}→ Dante SOCKS proxy removed${NC}"
@@ -200,9 +225,9 @@ if command -v privoxy &>/dev/null || systemctl cat privoxy.service &>/dev/null 2
     systemctl stop privoxy 2>/dev/null || true
     systemctl disable privoxy 2>/dev/null || true
     if [ "$PKG" = "apt" ]; then
-        apt-get purge -y -qq privoxy 2>/dev/null || true
+        apt-get purge -y privoxy >/dev/null 2>&1 || true
     else
-        yum remove -y -q privoxy 2>/dev/null || true
+        yum remove -y privoxy >/dev/null 2>&1 || true
     fi
     FOUND_OLD=1
     echo -e "  ${DIM}→ Privoxy removed${NC}"
@@ -213,9 +238,9 @@ if command -v tinyproxy &>/dev/null || systemctl cat tinyproxy.service &>/dev/nu
     systemctl stop tinyproxy 2>/dev/null || true
     systemctl disable tinyproxy 2>/dev/null || true
     if [ "$PKG" = "apt" ]; then
-        apt-get purge -y -qq tinyproxy 2>/dev/null || true
+        apt-get purge -y tinyproxy >/dev/null 2>&1 || true
     else
-        yum remove -y -q tinyproxy 2>/dev/null || true
+        yum remove -y tinyproxy >/dev/null 2>&1 || true
     fi
     FOUND_OLD=1
     echo -e "  ${DIM}→ Tinyproxy removed${NC}"
